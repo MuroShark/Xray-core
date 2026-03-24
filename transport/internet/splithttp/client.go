@@ -64,26 +64,50 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 
 	wrc = &WaitReadCloser{Wait: make(chan struct{})}
 	go func() {
-		resp, err := c.client.Do(req)
-		if err != nil {
-			if !uploadOnly { // stream-down is enough
+		if !uploadOnly && method == "GET" {
+			// Внедряем бесшовный реконнект для Downlink
+			seamlessReader := &SeamlessDownlinkReader{
+				client: c.client,
+				reqFactory: func() (*http.Request, error) {
+					newReq, err := http.NewRequestWithContext(context.WithoutCancel(ctx), "GET", url, nil)
+					if err == nil {
+						c.transportConfig.FillStreamRequest(newReq, sessionId, "")
+					}
+					return newReq, err
+				},
+			}
+
+			// Выполняем первичный запрос, чтобы сразу отловить ошибки (если сервер недоступен)
+			resp, err := c.client.Do(req)
+			if err != nil {
 				c.closed = true
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
+				gotConn.Close()
+				wrc.Close()
+				return
 			}
-			gotConn.Close()
-			wrc.Close()
-			return
-		}
-		if resp.StatusCode != 200 && !uploadOnly {
-			errors.LogInfo(ctx, "unexpected status ", resp.StatusCode)
-		}
-		if resp.StatusCode != 200 || uploadOnly { // stream-up
+			if resp.StatusCode != 200 {
+				errors.LogInfo(ctx, "unexpected status ", resp.StatusCode)
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				wrc.Close()
+				return
+			}
+			seamlessReader.body = resp.Body
+			wrc.(*WaitReadCloser).Set(seamlessReader)
+		} else {
+			// Оригинальная логика для Upload (POST-пакетов)
+			resp, err := c.client.Do(req)
+			if err != nil {
+				gotConn.Close()
+				wrc.Close()
+				return
+			}
 			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
+			resp.Body.Close()
 			wrc.Close()
 			return
 		}
-		wrc.(*WaitReadCloser).Set(resp.Body)
 	}()
 
 	<-gotConn.Wait()
